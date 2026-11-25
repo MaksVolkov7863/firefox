@@ -101,14 +101,67 @@ const {
   LOAD_FLAGS_FIRST_LOAD,
   LOAD_FLAGS_DISALLOW_INHERIT_PRINCIPAL,
   LOAD_FLAGS_ALLOW_THIRD_PARTY_FIXUP,
+  LOAD_FLAGS_BYPASS_CACHE,
+  LOAD_FLAGS_BYPASS_PROXY,
   LOAD_FLAGS_FIXUP_SCHEME_TYPOS,
   LOAD_FLAGS_FORCE_ALLOW_DATA_URI,
   LOAD_FLAGS_DISABLE_TRR,
+  LOAD_FLAGS_USER_ACTIVATION,
 } = Ci.nsIWebNavigation;
 
 const DIRECTION_FORWARD = 1;
 const DIRECTION_BACKWARD = -1;
 const TAB_LABEL_MAX_LENGTH = 256;
+const HAS_SCHEME_RE = /^[a-zA-Z][a-zA-Z\d+.-]*:/;
+
+/**
+ * Returns true if the browser is currently displaying a blank or initial page
+ * that is not controlled by arbitrary web content (e.g. a content opener).
+ *
+ * @param {MozBrowser} browser
+ * @param {Window} docGlobal
+ * @returns {boolean}
+ */
+function isSafeBlankOrInitialPage(browser, docGlobal) {
+  let spec = browser?.currentURI?.spec || "";
+  if (!spec) {
+    return true;
+  }
+  if (spec == "about:blank") {
+    return lazy.BrowserUIUtils.checkEmptyPageOrigin(browser);
+  }
+  return docGlobal.isBlankPageURL(spec) || docGlobal.isInitialPage(spec);
+}
+
+/**
+ * Returns true if a channel URI is a navigable destination worth preserving
+ * when a load from a blank/initial page is interrupted before commit.
+ *
+ * @param {nsIURI} uri
+ * @param {Window} docGlobal
+ * @returns {boolean}
+ */
+function isPreservableRequestURI(uri, docGlobal) {
+  if (!uri?.spec) {
+    return false;
+  }
+  if (
+    docGlobal.isBlankPageURL(uri.spec) ||
+    docGlobal.isInitialPage(uri) ||
+    uri.schemeIs("javascript") ||
+    uri.schemeIs("wyciwyg") ||
+    uri.schemeIs("keyword")
+  ) {
+    return false;
+  }
+  if (
+    uri.schemeIs("about") &&
+    ["neterror", "certerror", "blocked"].includes(uri.filePath)
+  ) {
+    return false;
+  }
+  return true;
+}
 
 /**
  * Updates the User Context UI indicators if the browser is in a non-default context
@@ -987,17 +1040,96 @@ export class Tabbrowser {
   }
 
   /**
+   * Returns true if the given tab is still on a safe blank/initial page with
+   * an interrupted load URL preserved in its URL bar state.
+   *
+   * @param {MozTabbrowserTab} [aTab]
+   * @returns {boolean}
+   */
+  hasPreservedInterruptedURL(aTab = this.selectedTab) {
+    if (!aTab) {
+      return false;
+    }
+    let preservedURL = TabProgressListener.getPreservedInterruptedURL(aTab);
+    if (!preservedURL) {
+      return false;
+    }
+    let browser = this.getBrowserForTab(aTab);
+    return (
+      browser?.userTypedValue === preservedURL &&
+      isSafeBlankOrInitialPage(browser, this.documentGlobal)
+    );
+  }
+
+  /**
+   * If the tab is on a safe blank/initial page with a preserved interrupted
+   * load URL still matching `userTypedValue`, retries that URL instead of
+   * reloading the blank/initial page.
+   *
+   * @param {MozTabbrowserTab} tab
+   * @param {number} [reloadFlags]
+   * @returns {boolean}
+   */
+  #tryLoadPreservedInterruptedURL(tab, reloadFlags = 0) {
+    if (!tab) {
+      return false;
+    }
+    let preservedURL = TabProgressListener.getPreservedInterruptedURL(tab);
+    if (!preservedURL) {
+      return false;
+    }
+    let browser = this.getBrowserForTab(tab);
+    if (!isSafeBlankOrInitialPage(browser, this.documentGlobal)) {
+      TabProgressListener.clearPreservedInterruptedURL(tab);
+      return false;
+    }
+    // Do not submit newer address-bar edits (including clearing the input)
+    // when the user invokes reload.
+    if (browser.userTypedValue !== preservedURL) {
+      return false;
+    }
+
+    TabProgressListener.clearPreservedInterruptedURL(tab);
+
+    let loadFlags =
+      LOAD_FLAGS_ALLOW_THIRD_PARTY_FIXUP |
+      LOAD_FLAGS_FIXUP_SCHEME_TYPOS |
+      LOAD_FLAGS_DISALLOW_INHERIT_PRINCIPAL |
+      (reloadFlags &
+        (LOAD_FLAGS_BYPASS_CACHE |
+          LOAD_FLAGS_BYPASS_PROXY |
+          LOAD_FLAGS_USER_ACTIVATION));
+
+    browser.userTypedValue = preservedURL;
+    browser.fixupAndLoadURIString(preservedURL, {
+      loadFlags,
+      triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
+    });
+    return true;
+  }
+
+  /**
    * Reloads the selected tab. Unlike `reloadWithFlags`, this ignores the
    * other multiselected tabs.
    */
   reload() {
+    if (this.#tryLoadPreservedInterruptedURL(this.selectedTab)) {
+      return undefined;
+    }
     return this.selectedBrowser.reload();
   }
 
   reloadWithFlags(reloadFlags) {
+    if (this.document.hasValidTransientUserGestureActivation) {
+      reloadFlags |= LOAD_FLAGS_USER_ACTIVATION;
+    }
+
     const unchangedRemoteness = [];
 
     for (const tab of this.selectedTabs) {
+      if (this.#tryLoadPreservedInterruptedURL(tab, reloadFlags)) {
+        continue;
+      }
       const browser = tab.linkedBrowser;
       const url = browser.currentURI;
       const urlSpec = url.spec;
@@ -1040,10 +1172,6 @@ export class Tabbrowser {
     }
     this.documentGlobal.gIdentityHandler.hidePopup();
     this.documentGlobal.gPermissionPanel.hidePopup();
-
-    if (this.document.hasValidTransientUserGestureActivation) {
-      reloadFlags |= Ci.nsIWebNavigation.LOAD_FLAGS_USER_ACTIVATION;
-    }
 
     for (const tab of unchangedRemoteness) {
       lazy.ReducedProtectionNotification.markUserReload(tab.linkedBrowser);
@@ -7721,6 +7849,9 @@ export class Tabbrowser {
   reloadTabs(tabs) {
     for (let tab of tabs) {
       try {
+        if (this.#tryLoadPreservedInterruptedURL(tab)) {
+          continue;
+        }
         this.getBrowserForTab(tab).reload();
       } catch (e) {
         // ignore failure to reload so others will be reloaded
@@ -7729,6 +7860,9 @@ export class Tabbrowser {
   }
 
   reloadTab(aTab) {
+    if (this.#tryLoadPreservedInterruptedURL(aTab)) {
+      return;
+    }
     let browser = this.getBrowserForTab(aTab);
     // Reset temporary permissions on the current tab. This is done here
     // because we only want to reset permissions on user reload.
@@ -10471,12 +10605,31 @@ class TabProgressListener {
   // Keyed by tab, because a tab's listener is replaced when its browser
   // changes remoteness mid-load.
   static #tabsNotSelectedSinceLoad = new WeakSet();
+  static #interruptedLoadState = new WeakMap();
 
   /**
    * @param {MozTabbrowserTab} tab
    */
   static onTabSelect(tab) {
     TabProgressListener.#tabsNotSelectedSinceLoad.delete(tab);
+  }
+
+  /**
+   * @param {MozTabbrowserTab} tab
+   * @returns {string | null}
+   */
+  static getPreservedInterruptedURL(tab) {
+    return TabProgressListener.#interruptedLoadState.get(tab)?.preservedURL ?? null;
+  }
+
+  /**
+   * @param {MozTabbrowserTab} tab
+   */
+  static clearPreservedInterruptedURL(tab) {
+    let state = TabProgressListener.#interruptedLoadState.get(tab);
+    if (state) {
+      state.preservedURL = null;
+    }
   }
 
   constructor(
@@ -10519,6 +10672,151 @@ class TabProgressListener {
 
   get #tabbrowser() {
     return this._tab.documentGlobal.gBrowser;
+  }
+
+  #recordInterruptedLoadStart(requestURI) {
+    let docGlobal = this.#documentGlobal;
+    let state = TabProgressListener.#interruptedLoadState.get(this._tab);
+    if (!isSafeBlankOrInitialPage(this._browser, docGlobal)) {
+      if (state) {
+        state.activeLoad = null;
+        state.preservedURL = null;
+      }
+      return;
+    }
+
+    let rawUserTyped = this._browser.userTypedValue;
+    let userTyped =
+      typeof rawUserTyped == "string" && rawUserTyped.trim()
+        ? rawUserTyped
+        : null;
+
+    let candidateURL = null;
+    if (userTyped !== null) {
+      if (
+        !docGlobal.isBlankPageURL(userTyped) &&
+        !docGlobal.isInitialPage(userTyped)
+      ) {
+        candidateURL = userTyped;
+      }
+    } else if (isPreservableRequestURI(requestURI, docGlobal)) {
+      candidateURL = requestURI.spec;
+    }
+
+    if (candidateURL !== null) {
+      if (!state) {
+        state = { activeLoad: null, preservedURL: null };
+        TabProgressListener.#interruptedLoadState.set(this._tab, state);
+      }
+      state.activeLoad = { url: candidateURL, committed: false };
+      state.preservedURL = null;
+    } else if (state) {
+      state.activeLoad = null;
+      state.preservedURL = null;
+    }
+  }
+
+  #clearActiveLoadOnSuccess() {
+    let state = TabProgressListener.#interruptedLoadState.get(this._tab);
+    if (!state) {
+      return;
+    }
+    if (state.activeLoad?.committed) {
+      state.preservedURL = null;
+    }
+    state.activeLoad = null;
+  }
+
+  #handleInterruptedLoadLocationChange(aLocation, isErrorPage) {
+    let spec = aLocation?.spec || "";
+    if (isErrorPage && spec == "about:blank") {
+      return;
+    }
+    let docGlobal = this.#documentGlobal;
+    let isBlankOrInitial =
+      !spec ||
+      docGlobal.isBlankPageURL(spec) ||
+      docGlobal.isInitialPage(aLocation);
+    if (!isBlankOrInitial) {
+      let state = TabProgressListener.#interruptedLoadState.get(this._tab);
+      if (state) {
+        if (state.activeLoad) {
+          state.activeLoad.committed = true;
+        }
+        state.preservedURL = null;
+      }
+    }
+  }
+
+  #maybePreserveInterruptedLoadOnStop(requestURI, aStatus) {
+    let docGlobal = this.#documentGlobal;
+    if (!isSafeBlankOrInitialPage(this._browser, docGlobal)) {
+      let state = TabProgressListener.#interruptedLoadState.get(this._tab);
+      if (state) {
+        state.activeLoad = null;
+        state.preservedURL = null;
+      }
+      return false;
+    }
+
+    if (
+      aStatus == Cr.NS_BINDING_CANCELLED_OLD_LOAD ||
+      this._browser.isNavigating
+    ) {
+      return true;
+    }
+
+    let state = TabProgressListener.#interruptedLoadState.get(this._tab);
+    let activeLoad = state?.activeLoad ?? null;
+    if (!activeLoad && isPreservableRequestURI(requestURI, docGlobal)) {
+      activeLoad = { url: requestURI.spec, committed: false };
+    }
+
+    if (!activeLoad || activeLoad.committed) {
+      if (state) {
+        state.activeLoad = null;
+      }
+      return false;
+    }
+
+    // Do not clobber a newer address-bar edit (including clearing the input)
+    // made while this load was still in flight.
+    let startedLoadSinceTyping =
+      this._browser.didStartLoadSinceLastUserTyping();
+    let currentTyped = this._browser.userTypedValue;
+    if (
+      !startedLoadSinceTyping &&
+      typeof currentTyped == "string" &&
+      currentTyped != activeLoad.url
+    ) {
+      if (state) {
+        state.activeLoad = null;
+        state.preservedURL = null;
+      }
+      return true;
+    }
+
+    if (!state) {
+      state = { activeLoad: null, preservedURL: null };
+      TabProgressListener.#interruptedLoadState.set(this._tab, state);
+    }
+    state.activeLoad = null;
+    state.preservedURL = activeLoad.url;
+
+    this._browser.userTypedValue = activeLoad.url;
+    this.#tabbrowser.setInitialTabTitle(this._tab, activeLoad.url, {
+      isURL: HAS_SCHEME_RE.test(activeLoad.url),
+    });
+
+    if (this._tab.selected) {
+      docGlobal.gURLBar.setURI();
+      if (!docGlobal.browsingContext?.isDocumentPiP) {
+        docGlobal.document
+          .getElementById("Browser:Reload")
+          ?.removeAttribute("disabled");
+      }
+    }
+    return true;
   }
 
   destroy() {
@@ -10716,6 +11014,8 @@ class TabProgressListener {
         delete this._browser.initiatedFromNonWebControlled;
         // If the browser is loading it must not be crashed anymore
         this._tab.removeAttribute("crashed");
+
+        this.#recordInterruptedLoadStart(originalLocation || location);
       }
 
       if (this._shouldShowProgress(aRequest)) {
@@ -10772,7 +11072,16 @@ class TabProgressListener {
 
       if (aWebProgress.isTopLevel) {
         let isSuccessful = Components.isSuccessCode(aStatus);
-        if (!isSuccessful && !this._tab.isEmpty) {
+        if (isSuccessful) {
+          this._browser.urlbarChangeTracker.finishedLoad();
+          this.#clearActiveLoadOnSuccess();
+        } else if (
+          !this.#maybePreserveInterruptedLoadOnStop(
+            originalLocation || location,
+            aStatus
+          ) &&
+          !this._tab.isEmpty
+        ) {
           // Restore the current document's location in case the
           // request was stopped (possibly from a content script)
           // before the location changed.
@@ -10797,8 +11106,6 @@ class TabProgressListener {
           ) {
             this.#documentGlobal.gURLBar.setURI();
           }
-        } else if (isSuccessful) {
-          this._browser.urlbarChangeTracker.finishedLoad();
         }
       }
 
@@ -10900,6 +11207,10 @@ class TabProgressListener {
         (isSameDocument && !this._browser.userTypedValue)
       ) {
         this._browser.userTypedValue = null;
+      }
+
+      if (!isSameDocument) {
+        this.#handleInterruptedLoadLocationChange(aLocation, isErrorPage);
       }
 
       // If the tab has been set to "busy" outside the stateChange

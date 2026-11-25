@@ -2312,12 +2312,13 @@ var XULBrowserWindow = {
       gTrustPanelHandler.resetIconForNavigation(aLocationURI);
     }
     if (
-      (location == "about:blank" &&
-        BrowserUIUtils.checkEmptyPageOrigin(gBrowser.selectedBrowser)) ||
-      location == "" ||
-      (location == "about:newtab" && !this.newTabPageEnabled) ||
-      location == "chrome://browser/content/blanktab.html" ||
-      window.browsingContext.isDocumentPiP
+      window.browsingContext.isDocumentPiP ||
+      (!gBrowser.hasPreservedInterruptedURL() &&
+        ((location == "about:blank" &&
+          BrowserUIUtils.checkEmptyPageOrigin(gBrowser.selectedBrowser)) ||
+          location == "" ||
+          (location == "about:newtab" && !this.newTabPageEnabled) ||
+          location == "chrome://browser/content/blanktab.html"))
     ) {
       // Second condition is for new tabs, otherwise
       // reload function is enabled until tab is refreshed.
